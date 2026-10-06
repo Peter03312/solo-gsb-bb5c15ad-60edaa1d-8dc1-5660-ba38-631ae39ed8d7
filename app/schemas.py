@@ -94,6 +94,34 @@ class DrillRequest(StrictModel):
     close_valves: list[str] = Field(default_factory=list)
 
 
+class DeratedCapacityIn(StrictModel):
+    """降额预演中的单个设施临时容量上限（水源或管段）。
+
+    有限非负由本层保证；“不得超过当前额定容量”“设施必须存在且类别正确”
+    需要结合已提交管网快照，在服务层逐条定位校验。
+    """
+
+    facility_id: str = Field(min_length=1, max_length=64, description="设施编号（水源或管段）")
+    capacity: float = Field(
+        ge=0, description="抢修期间的临时容量上限（有限非负，且不超过当前额定容量）"
+    )
+
+    @field_validator("capacity")
+    @classmethod
+    def _cap_finite(cls, v: float) -> float:
+        return _finite(v)
+
+
+class DeratingPreviewRequest(StrictModel):
+    """抢修降额影响预演：携带所见修订号与水源/管段临时容量上限（只读，不写入）。"""
+
+    revision: int = Field(
+        ge=0, description="客户端当前所见管网基准修订号（过期则整单拒绝）"
+    )
+    sources: list[DeratedCapacityIn] = Field(default_factory=list)
+    pipes: list[DeratedCapacityIn] = Field(default_factory=list)
+
+
 class RestoreStepIn(StrictModel):
     """复水计划中的单步：对某只阀门执行开/关。
 
