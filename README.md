@@ -4,6 +4,10 @@
 **不可并联**的水源对、**单向管段**及容量、管段上的阀门状态、用水点需求与优先级；支持阀门
 **整批校验、原子生效**，并在**不写入状态**的前提下预演关阀后各用水点的供水分配。
 
+抢修前还可用**降额预演**评估泵站（水源）或管段临时降额的影响：提交所见修订号与若干
+水源/管段的临时容量上限，服务以**同一已提交快照**分别计算现状与降额情景，返回两种分配
+结果、各用水点获水变化与降额设施容量使用情况；纯预演，不改变管网、阀位、计划或修订号。
+
 复水时必须按**阀门操作清单逐步恢复**：服务对开/关步骤做逐步预演（每一步都按无向开启管段
 复核互锁水源），全部安全才保存**不可变计划**；执行端携带**基准修订号**逐步提交，服务在同一
 事务内复核修订与安全性、更新阀位与进度，重复提交幂等回放，过期/跳步拒绝。
@@ -49,6 +53,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 bash examples/demo.sh                 # 关阀隔离预演（原能力），默认 http://localhost:8080
 bash examples/demo.sh http://主机:端口
 bash examples/restore_demo.sh         # 复水计划：逐步预演 → 保存 → 修订号逐步执行
+bash examples/derating_demo.sh        # 降额预演：现状 vs 降额情景对比（只读）
 ```
 
 ---
@@ -111,6 +116,7 @@ Compose 的端口映射在 `docker-compose.yml` 中修改左侧即可（如 `"18
 | POST | `/api/valves/change` | 阀门**整批变更**（原子生效；成功 `revision+1`，未完计划失效） |
 | POST | `/api/drill` | 关阀隔离**预演**（只读，不写入） |
 | GET | `/api/status` | 当前真实阀位下的分派结果（含 `revision`） |
+| POST | `/api/derating` | 水源/管段**降额预演**（只读；同一快照的现状 vs 降额情景对比） |
 | POST | `/api/restore/plans` | 复水**逐步预演**；全部安全才保存不可变计划 |
 | GET | `/api/restore/plans` | 计划列表（状态/进度） |
 | GET | `/api/restore/plans/{plan_id}` | 计划详情（不可变步骤与进度） |
@@ -247,7 +253,89 @@ curl -X POST http://localhost:8080/api/drill \
 - `by_source`：该点水量分别来自哪些水源；
 - `source_utilization` / `pipe_utilization`：全局占用情况，可核对“容量不重复占用”。
 
-### 4.4 错误码速查
+### 4.4 抢修降额预演 `POST /api/derating`
+
+抢修前评估**泵站（水源）或管段降额**对供水的影响。提交所见修订号与若干临时容量上限；
+服务以**同一已提交管网快照**分别计算现状与降额情景（沿用现有阀位、单向流量、用水点
+优先级与共享容量规则）。纯预演：不写库，管网、阀位、计划与修订号均不改变。
+
+```bash
+# revision 取自 GET /api/status 或 GET /api/network 的 revision
+curl -X POST http://localhost:8080/api/derating \
+  -H 'Content-Type: application/json' \
+  -d '{"revision": 1, "items": [
+        {"kind": "source", "id": "S1", "max_capacity": 4},
+        {"kind": "pipe",   "id": "P3", "max_capacity": 2}
+      ]}'
+```
+
+请求体：
+
+- `revision`：客户端所见的当前基准修订号；过期返回 409 `revision_conflict`，不计算；
+- `items[]`：降额项，`kind` 为 `source`/`pipe`，`id` 为设施编号，
+  `max_capacity` 为临时容量上限——须为**有限非负数**且**不得超过当前额定容量**；
+  同一设施（同 `kind`+`id`）不得重复。`items` 为空时降额情景与现状一致。
+
+响应（节选）：
+
+```json
+{
+  "message": "降额预演完成：本次结果为临时计算，未写入任何状态（管网、阀位、计划与修订号均未改变）",
+  "revision": 1,
+  "items": [
+    {"kind": "source", "id": "S1", "rated_capacity": 10.0, "max_capacity": 4.0},
+    {"kind": "pipe",   "id": "P3", "rated_capacity": 4.0,  "max_capacity": 2.0}
+  ],
+  "baseline": {"allocations": ["...同 /api/status 口径..."], "totals": {"...": "..."},
+               "source_utilization": ["..."], "pipe_utilization": ["..."]},
+  "derated":  {"allocations": ["...同上..."], "totals": {"...": "..."},
+               "source_utilization": ["..."], "pipe_utilization": ["..."]},
+  "demand_changes": [
+    {"demand_id": "D1", "priority": 9, "requested": 10.0,
+     "baseline_supplied": 10.0, "derated_supplied": 4.0, "delta": -6.0,
+     "baseline_fulfilled": true, "derated_fulfilled": false,
+     "baseline_shortfall": 0.0, "derated_shortfall": 6.0}
+  ],
+  "derated_utilization": [
+    {"kind": "source", "id": "S1", "rated_capacity": 10.0, "max_capacity": 4.0,
+     "used": 4.0, "remaining": 0.0},
+    {"kind": "pipe", "id": "P3", "rated_capacity": 4.0, "max_capacity": 2.0,
+     "used": 2.0, "remaining": 0.0, "conducting": true}
+  ]
+}
+```
+
+字段含义：
+
+- `baseline` / `derated`：现状与降额情景的完整分派结果，口径与 `/api/status` 一致
+  （降额情景中 `source_utilization`/`pipe_utilization` 的 `capacity` 为临时上限）；
+- `demand_changes`：各用水点获水变化（按优先级降序、编号升序），`delta` 为
+  降额后减现状的获水差值；
+- `derated_utilization`：降额设施在降额情景下的容量使用（额定 vs 临时上限 vs 实际占用）。
+
+非法清单整体拒绝（400 `invalid_derating`，逐条定位、不返回混合版本结果）：
+
+```json
+{
+  "error": {
+    "code": "invalid_derating",
+    "message": "降额清单校验失败，未进行任何预演计算",
+    "details": [
+      {"location": "items[0].id", "code": "unknown_source",
+       "message": "未知水源：GHOST（设施不存在）"},
+      {"location": "items[1].kind", "code": "unknown_kind",
+       "message": "非法设施类别：'valve'（只允许 source/pipe）"},
+      {"location": "items[2].id", "code": "duplicate_item",
+       "message": "管段 P3 在降额清单中重复出现"},
+      {"location": "items[3].max_capacity", "code": "capacity_exceeded",
+       "rated_capacity": 10.0,
+       "message": "临时上限 99.0 超过水源 S1 的当前额定容量 10.0"}
+    ]
+  }
+}
+```
+
+### 4.5 错误码速查
 
 | HTTP | `error.code` | 触发场景 |
 | --- | --- | --- |
@@ -256,9 +344,10 @@ curl -X POST http://localhost:8080/api/drill \
 | 400 | `invalid_valve_change` | 未知/非法阀门编号、批次内重复、`action` 与 `is_open` 冲突 |
 | 409 | `forbidden_sources_connected` | 变更/复水某步会使互锁水源经开启管段连通 |
 | 400 | `invalid_drill` | 预演阀门编号未知/重复 |
+| 400 | `invalid_derating` | 降额项含未知设施、错误类别、重复条目或越额（带 `items[i].*` 定位，不计算） |
+| 409 | `revision_conflict` | 降额预演/计划执行携带的修订号已过期（不计算、状态不变，需重取后重试） |
 | 400 | `invalid_restore_plan` | 复水步骤含未知阀门、非法动作或重复阀门（带 `steps[i].*` 定位，计划不保存） |
 | 404 | `plan_not_found` | 计划编号不存在 |
-| 409 | `revision_conflict` | 执行时携带的修订号已过期（状态不变，需重取后重试） |
 | 409 | `step_out_of_order` | 跳步：提交的不是计划的下一步（状态不变） |
 | 409 | `plan_invalidated` | 计划已因管网录入/清空或阀门变更失效 |
 | 409 | `plan_already_completed` | 计划已全部完成（重放已完成步骤需带 `step`） |
@@ -380,43 +469,49 @@ curl -X POST http://localhost:8080/api/restore/plans/PLAN-9f2c.../execute \
 
 > 与旧版的兼容：以上均为**新增字段/新增接口**；`PUT/GET/DELETE /api/network`、
 > `/api/valves/change` 的原有字段与错误码不变，老客户端无需改造。
+> 本轮新增的 `POST /api/derating` 同为纯新增只读接口，不影响既有接口行为。
 
 ---
 
-## 5. 目录结构
+## 6. 目录结构
 
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由、错误处理、整批事务、复水计划执行
+│   ├── main.py        # FastAPI 路由、错误处理、整批事务、降额预演、复水计划执行
 │   ├── engine.py      # 校验、互锁连通(BFS)、Dinic 最大流、优先级贪心预演
 │   ├── plans.py       # 复水步骤校验、逐步预演、逐步结果快照
 │   ├── schemas.py     # Pydantic 请求模型
 │   ├── database.py    # SQLite 连接、建表、修订号
 │   └── repository.py  # DB <-> 内存模型；计划/步骤/结果持久化
-├── tests/             # pytest：25 项端到端 + 引擎测试
+├── tests/             # pytest：36 项端到端 + 引擎测试
 ├── examples/
 │   ├── sample_network.json
 │   ├── demo.sh            # 关阀隔离 curl 端到端示例
-│   └── restore_demo.sh    # 复水计划 curl 端到端示例
+│   ├── restore_demo.sh    # 复水计划 curl 端到端示例
+│   └── derating_demo.sh   # 降额预演 curl 端到端示例
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
 ```
 
-## 6. 运行测试
+## 7. 运行测试
 
 ```bash
 python -m pip install pytest httpx
 python -m pytest -q
 ```
 
-## 7. 设计说明与边界
+## 8. 设计说明与边界
 
 - 管段单向用于**供水方向**的流量计算；互锁水源的**连通性**检查按无向（见 §3 规则 2）。
 - 容量为浮点（内部以 1e-9 容差判定饱和）；需求为 0 的点直接判定为已满足。
 - 未挂阀门的管段视为常通；管段上任一阀门关闭即不导通。
 - 预演仅支持“拟关闭”阀门（抢修预演的实际需求）；库内已关闭阀门自然叠加生效。
+- **降额预演不写入**：临时上限只作用于内存中的管网副本（水源/管段容量替换为
+  `max_capacity`，阀位与其余设施原样沿用），库内管网、阀位、计划与修订号均不变；
+  读取、修订号复核与现状/降额两次模拟在同一写锁内完成，两种情景严格基于
+  同一已提交快照，不返回混合版本结果；`max_capacity` 等于额定容量为合法边界。
 - **复水预演不写入**：逐步开/关只在内存中的 `Network` 副本上叠加，库内阀位不变；
   计划保存只写入 `plans/plan_steps`，也不动阀位。
 - **计划不可变**：保存后步骤、动作、顺序不可修改；执行只推进 `status/next_step` 与

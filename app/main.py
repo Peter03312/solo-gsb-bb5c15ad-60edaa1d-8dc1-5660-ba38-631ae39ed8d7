@@ -8,6 +8,7 @@
   POST   /api/valves/change            阀门整批变更（原子生效；使未完计划失效，revision+1）
   POST   /api/drill                    关阀隔离预演（只读，不写入）
   GET    /api/status                   当前真实阀位下的分派结果（含 revision）
+  POST   /api/derating                 水源/管段降额预演（只读；现状 vs 降额情景对比）
   POST   /api/restore/plans            复水逐步预演；全部安全才保存不可变计划
   GET    /api/restore/plans            计划列表
   GET    /api/restore/plans/{plan_id}  计划详情（步骤与进度）
@@ -29,6 +30,7 @@ from fastapi.exceptions import RequestValidationError
 from . import database
 from .database import bump_revision, get_conn, get_revision
 from .engine import (
+    EPS,
     Network,
     build_network,
     find_forbidden_connections,
@@ -47,6 +49,7 @@ from .repository import (
     serialize_network,
 )
 from .schemas import (
+    DeratingRequest,
     DrillRequest,
     NetworkLoad,
     PlanExecuteRequest,
@@ -129,6 +132,7 @@ def root():
         "endpoints": [
             "PUT /api/network", "GET /api/network", "DELETE /api/network",
             "POST /api/valves/change", "POST /api/drill", "GET /api/status",
+            "POST /api/derating",
             "POST /api/restore/plans", "GET /api/restore/plans",
             "GET /api/restore/plans/{plan_id}",
             "POST /api/restore/plans/{plan_id}/execute",
@@ -365,6 +369,179 @@ def status(conn=Depends(get_conn)):
     result = simulate(network, force_closed=set())
     result["revision"] = get_revision(conn)
     return result
+
+
+# --------------------------------------------------------------------------- #
+# 抢修降额预演（只读，不写入状态）
+# --------------------------------------------------------------------------- #
+@app.post("/api/derating")
+def derating_preview(payload: DeratingRequest, conn=Depends(get_conn)):
+    """评估水源（泵站）/管段临时降额对供水分配的影响。
+
+    以同一已提交管网快照分别计算现状与降额情景（沿用现有阀位、单向流量、
+    用水点优先级与共享容量规则），返回两种分配结果、各用水点获水变化与
+    降额设施的容量使用情况。纯预演：管网、阀位、计划与修订号均不改变。
+    """
+    with _write_lock:
+        # 读取、修订号复核与两次模拟都在写锁内完成（与复水计划创建同理）：
+        # 保证现状/降额基于同一已提交快照，不与写操作穿插而返回混合版本结果
+        network = load_network(conn)
+        if network is None:
+            return error_response(
+                409, "network_not_initialized",
+                "尚未录入管网数据，请先调用 PUT /api/network",
+            )
+
+        # 1) 过期修订号：拒绝且不进行任何计算
+        current_revision = get_revision(conn)
+        if payload.revision != current_revision:
+            return error_response(
+                409, "revision_conflict",
+                f"修订号已过期：所见 {payload.revision}，当前 {current_revision}；"
+                "请重新查询当前管网/分派并重试，本次未进行任何预演计算",
+                [{
+                    "location": "revision",
+                    "code": "stale_revision",
+                    "seen_revision": payload.revision,
+                    "current_revision": current_revision,
+                }],
+            )
+
+        # 2) 条目级校验：错误类别、未知设施、重复条目、越额，逐条定位一次性返回
+        kind_names = {"source": "水源", "pipe": "管段"}
+        details: list[dict] = []
+        accepted: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for i, item in enumerate(payload.items):
+            loc = f"items[{i}]"
+            kind, fid = item.kind, item.id
+            if kind not in kind_names:
+                details.append({
+                    "location": f"{loc}.kind",
+                    "code": "unknown_kind",
+                    "message": f"非法设施类别：{kind!r}（只允许 source/pipe）",
+                })
+                continue
+            rated: float | None = None
+            if kind == "source":
+                node = network.nodes.get(fid)
+                if node is not None and node.type == "source":
+                    rated = node.capacity or 0.0
+            else:
+                pipe = network.pipes.get(fid)
+                if pipe is not None:
+                    rated = pipe.capacity
+            if rated is None:
+                details.append({
+                    "location": f"{loc}.id",
+                    "code": f"unknown_{kind}",
+                    "message": f"未知{kind_names[kind]}：{fid}（设施不存在）",
+                })
+                continue
+            key = (kind, fid)
+            if key in seen:
+                details.append({
+                    "location": f"{loc}.id",
+                    "code": "duplicate_item",
+                    "message": f"{kind_names[kind]} {fid} 在降额清单中重复出现",
+                })
+                continue
+            seen.add(key)
+            if item.max_capacity > rated + EPS:
+                details.append({
+                    "location": f"{loc}.max_capacity",
+                    "code": "capacity_exceeded",
+                    "rated_capacity": rated,
+                    "message": f"临时上限 {item.max_capacity} 超过{kind_names[kind]} "
+                               f"{fid} 的当前额定容量 {rated}",
+                })
+                continue
+            accepted.append({
+                "kind": kind,
+                "id": fid,
+                "rated_capacity": rated,
+                "max_capacity": float(item.max_capacity),
+            })
+        if details:
+            return error_response(
+                400, "invalid_derating",
+                "降额清单校验失败，未进行任何预演计算", details,
+            )
+
+        # 3) 构造降额副本（仅内存）：额定容量替换为临时上限，阀位等其余原样沿用
+        derated_nodes = dict(network.nodes)
+        derated_pipes = dict(network.pipes)
+        for it in accepted:
+            if it["kind"] == "source":
+                derated_nodes[it["id"]] = replace(
+                    derated_nodes[it["id"]], capacity=it["max_capacity"]
+                )
+            else:
+                derated_pipes[it["id"]] = replace(
+                    derated_pipes[it["id"]], capacity=it["max_capacity"]
+                )
+        derated_network = Network(
+            derated_nodes, derated_pipes, network.valves,
+            network.forbidden_pairs, network.valves_by_pipe,
+        )
+
+        # 4) 同一快照上分别模拟现状与降额情景（无降额项时二者自然一致）
+        baseline = simulate(network, force_closed=set())
+        derated = simulate(derated_network, force_closed=set())
+
+    # 各用水点获水变化：同一排序口径（优先级降序、编号升序），按编号对齐
+    baseline_by_id = {a["demand_id"]: a for a in baseline["allocations"]}
+    demand_changes = [
+        {
+            "demand_id": a["demand_id"],
+            "priority": a["priority"],
+            "requested": a["requested"],
+            "baseline_supplied": baseline_by_id[a["demand_id"]]["supplied"],
+            "derated_supplied": a["supplied"],
+            "delta": round(
+                a["supplied"] - baseline_by_id[a["demand_id"]]["supplied"], 9
+            ),
+            "baseline_fulfilled": baseline_by_id[a["demand_id"]]["fulfilled"],
+            "derated_fulfilled": a["fulfilled"],
+            "baseline_shortfall": baseline_by_id[a["demand_id"]]["shortfall"],
+            "derated_shortfall": a["shortfall"],
+        }
+        for a in derated["allocations"]
+    ]
+
+    # 降额设施在降额情景下的容量使用情况（额定 vs 临时上限 vs 实际占用）
+    src_util = {s["source_id"]: s for s in derated["source_utilization"]}
+    pipe_util = {p["pipe_id"]: p for p in derated["pipe_utilization"]}
+    derated_utilization: list[dict] = []
+    for it in accepted:
+        if it["kind"] == "source":
+            u = src_util[it["id"]]
+            derated_utilization.append({
+                "kind": "source", "id": it["id"],
+                "rated_capacity": it["rated_capacity"],
+                "max_capacity": it["max_capacity"],
+                "used": u["used"], "remaining": u["remaining"],
+            })
+        else:
+            u = pipe_util[it["id"]]
+            derated_utilization.append({
+                "kind": "pipe", "id": it["id"],
+                "rated_capacity": it["rated_capacity"],
+                "max_capacity": it["max_capacity"],
+                "used": u["used"], "remaining": u["remaining"],
+                "conducting": u["conducting"],
+            })
+
+    return {
+        "message": "降额预演完成：本次结果为临时计算，未写入任何状态"
+        "（管网、阀位、计划与修订号均未改变）",
+        "revision": current_revision,
+        "items": accepted,
+        "baseline": baseline,
+        "derated": derated,
+        "demand_changes": demand_changes,
+        "derated_utilization": derated_utilization,
+    }
 
 
 # --------------------------------------------------------------------------- #

@@ -117,3 +117,33 @@ class PlanExecuteRequest(StrictModel):
     step: Optional[int] = Field(
         default=None, ge=1, description="拟执行的步骤位置（1 基）；缺省为计划的下一步"
     )
+
+
+class DeratingItemIn(StrictModel):
+    """单项降额：某水源/管段的临时容量上限（仅本次预演生效，不写入状态）。
+
+    kind 不用 Literal：非法类别需与未知设施、重复条目、越额一起在服务层逐条定位报错。
+    """
+
+    kind: str = Field(min_length=1, description="设施类别：source（水源）/ pipe（管段）")
+    id: str = Field(min_length=1, description="设施编号")
+    max_capacity: float = Field(
+        ge=0, description="临时容量上限（非负，且不得超过当前额定容量）"
+    )
+
+    @field_validator("max_capacity")
+    @classmethod
+    def _cap_finite(cls, v: float) -> float:
+        return _finite(v)
+
+
+class DeratingRequest(StrictModel):
+    """降额预演：基于所见修订号的同一已提交快照，对比现状与降额情景（只读）。
+
+    items 为空时不做任何降额，降额情景与现状一致。
+    """
+
+    revision: int = Field(ge=0, description="客户端所见的当前基准修订号")
+    items: list[DeratingItemIn] = Field(
+        default_factory=list, description="降额项清单；同一设施不得重复"
+    )
